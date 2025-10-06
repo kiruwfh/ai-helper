@@ -1,66 +1,514 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>AI Helper Injector</title>
-</head>
-<body>
-  <h1 style="text-align:center;font-family:Arial;padding:50px">
-    ⏳ Запускаю AI Helper...
-  </h1>
-  <script>
-    // Получаем referrer (страницу откуда пришли)
-    const referrer = document.referrer;
-    
-    if (!referrer || referrer.includes('github.io')) {
-      document.body.innerHTML = `
-        <div style="font-family:Arial;padding:50px;text-align:center">
-          <h1>❌ Ошибка</h1>
-          <p>Сначала открой страницу с тестом, ПОТОМ открой эту закладку!</p>
-          <p style="margin-top:20px;color:#666">
-            <small>Эта страница должна открываться с другого сайта</small>
-          </p>
-        </div>
-      `;
-    } else {
-      // Пытаемся инжектить через opener
-      if (window.opener && !window.opener.closed) {
-        try {
-          const script = window.opener.document.createElement('script');
-          script.src = 'https://kiruwfh.github.io/ai-helper/ai-helper.js?' + Date.now();
-          window.opener.document.body.appendChild(script);
-          
-          document.body.innerHTML = `
-            <div style="font-family:Arial;padding:50px;text-align:center">
-              <h1>✅ Скрипт запущен!</h1>
-              <p>Проверь исходную вкладку</p>
-              <p style="margin-top:20px">
-                <small>Это окно закроется через 2 секунды...</small>
-              </p>
-            </div>
-          `;
-          
-          setTimeout(() => window.close(), 2000);
-        } catch(e) {
-          document.body.innerHTML = `
-            <div style="font-family:Arial;padding:50px;text-align:center">
-              <h1>❌ Ошибка доступа</h1>
-              <p>${e.message}</p>
-              <p style="margin-top:20px;color:#666">
-                <small>Страница теста блокирует доступ (CORS/Same-Origin Policy)</small>
-              </p>
-            </div>
-          `;
-        }
-      } else {
-        document.body.innerHTML = `
-          <div style="font-family:Arial;padding:50px;text-align:center">
-            <h1>⚠️ Нет доступа</h1>
-            <p>Не удалось получить доступ к исходной странице</p>
-          </div>
-        `;
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Helper - Auto Mode</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+
+    .container {
+      background: white;
+      border-radius: 24px;
+      padding: 40px;
+      max-width: 700px;
+      width: 100%;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+      text-align: center;
+    }
+
+    h1 {
+      color: #333;
+      margin-bottom: 15px;
+      font-size: 38px;
+    }
+
+    .subtitle {
+      color: #666;
+      margin-bottom: 30px;
+      line-height: 1.6;
+      font-size: 16px;
+    }
+
+    .btn {
+      background: linear-gradient(135deg, #667eea, #764ba2);
+      color: white;
+      border: none;
+      padding: 18px 45px;
+      font-size: 22px;
+      font-weight: bold;
+      border-radius: 50px;
+      cursor: pointer;
+      box-shadow: 0 8px 24px rgba(102, 126, 234, 0.4);
+      transition: all 0.3s ease;
+      margin: 10px;
+    }
+
+    .btn:hover:not(:disabled) {
+      transform: translateY(-3px);
+      box-shadow: 0 12px 32px rgba(102, 126, 234, 0.6);
+    }
+
+    .btn:disabled {
+      background: linear-gradient(135deg, #999, #777);
+      cursor: not-allowed;
+      opacity: 0.7;
+    }
+
+    .btn-stop {
+      background: linear-gradient(135deg, #f44336, #d32f2f);
+    }
+
+    .btn-manual {
+      background: linear-gradient(135deg, #4CAF50, #45a049);
+    }
+
+    #status {
+      margin-top: 30px;
+      padding: 25px;
+      background: #e7f3ff;
+      border: 2px solid #2196F3;
+      border-radius: 12px;
+      display: none;
+      animation: slideIn 0.5s ease-out;
+    }
+
+    @keyframes slideIn {
+      from {
+        opacity: 0;
+        transform: translateY(-20px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
       }
     }
+
+    .success {
+      background: #d4edda;
+      border-color: #c3e6cb;
+      color: #155724;
+    }
+
+    .error {
+      background: #f8d7da;
+      border-color: #f5c6cb;
+      color: #721c24;
+    }
+
+    .instructions {
+      background: #fff3cd;
+      border-left: 4px solid #ffc107;
+      padding: 20px;
+      margin-top: 30px;
+      border-radius: 8px;
+      text-align: left;
+      font-size: 14px;
+      color: #856404;
+    }
+
+    .instructions h3 {
+      margin-bottom: 12px;
+      font-size: 18px;
+    }
+
+    .instructions ol, .instructions ul {
+      margin-left: 20px;
+      line-height: 1.8;
+    }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 15px;
+      margin-top: 20px;
+    }
+
+    .stat-box {
+      background: #f8f9fa;
+      padding: 15px;
+      border-radius: 10px;
+      border-left: 4px solid #667eea;
+    }
+
+    .stat-value {
+      font-size: 32px;
+      font-weight: bold;
+      color: #667eea;
+    }
+
+    .stat-label {
+      font-size: 12px;
+      color: #666;
+      margin-top: 5px;
+    }
+
+    .interval-selector {
+      margin: 20px 0;
+    }
+
+    .interval-selector select {
+      padding: 10px 20px;
+      font-size: 16px;
+      border: 2px solid #667eea;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+
+    code {
+      background: #f4f4f4;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: monospace;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🤖 AI Helper - Auto Mode</h1>
+    <p class="subtitle">
+      Automatically analyzes test and shows answers in notifications!<br>
+      <strong>Works even in fullscreen mode</strong>
+    </p>
+
+    <div class="interval-selector">
+      <label for="interval" style="font-size:16px;color:#333;font-weight:bold">Check interval:</label><br>
+      <select id="interval" style="margin-top:10px">
+        <option value="5">Every 5 seconds (Fast)</option>
+        <option value="10" selected>Every 10 seconds (Recommended)</option>
+        <option value="15">Every 15 seconds</option>
+        <option value="20">Every 20 seconds</option>
+        <option value="30">Every 30 seconds</option>
+      </select>
+    </div>
+
+    <button id="startBtn" class="btn">🚀 Start Auto Mode</button>
+    <button id="manualBtn" class="btn btn-manual" style="display:none">🔍 Get Answer Now</button>
+    <button id="stopBtn" class="btn btn-stop" style="display:none">⏹️ Stop</button>
+
+    <div id="status"></div>
+
+    <div class="stats" id="stats" style="display:none">
+      <div class="stat-box">
+        <div class="stat-value" id="questionsCount">0</div>
+        <div class="stat-label">Questions Analyzed</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-value" id="lastAnswer">-</div>
+        <div class="stat-label">Last Answer</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-value" id="timeRunning">0:00</div>
+        <div class="stat-label">Time Running</div>
+      </div>
+    </div>
+
+    <div class="instructions">
+      <h3>📖 How to use:</h3>
+      <ol>
+        <li><strong>BEFORE starting test:</strong> Click "Start Auto Mode"</li>
+        <li>Select the <strong>test tab</strong> in screen share dialog</li>
+        <li><strong>Start your test</strong> (go fullscreen if needed)</li>
+        <li>AI will automatically check every N seconds</li>
+        <li><strong>Notification appears</strong> with answer (on top of fullscreen!)</li>
+        <li>Continue test - notifications keep coming!</li>
+      </ol>
+    </div>
+
+    <div class="instructions" style="background:#e7f3ff;border-left-color:#2196F3;color:#1976D2">
+      <h3>💡 How it works:</h3>
+      <ul>
+        <li>Takes screenshot every N seconds</li>
+        <li>Detects if question changed</li>
+        <li>Sends to AI for analysis</li>
+        <li>Shows notification with answer</li>
+        <li><strong>Notifications appear even in fullscreen!</strong></li>
+      </ul>
+    </div>
+
+    <div class="instructions" style="background:#f8d7da;border-left-color:#f44336;color:#721c24">
+      <h3>⚠️ Important:</h3>
+      <ul>
+        <li>Keep this tab open in background</li>
+        <li>Don't close the browser</li>
+        <li>Allow notifications when browser asks</li>
+        <li>Test must be visible on screen (not minimized)</li>
+      </ul>
+    </div>
+  </div>
+
+  <script>
+    const API_KEY = 'AIzaSyDmJEzLEv3Qo50iFoYJ5jWCda49m3jCK5I';
+    
+    let mediaStream = null;
+    let isRunning = false;
+    let intervalId = null;
+    let lastScreenshot = null;
+    let questionsAnalyzed = 0;
+    let startTime = null;
+
+    const startBtn = document.getElementById('startBtn');
+    const manualBtn = document.getElementById('manualBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const status = document.getElementById('status');
+    const stats = document.getElementById('stats');
+    const intervalSelect = document.getElementById('interval');
+
+    // Request notification permission on load
+    if ('Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+
+    startBtn.addEventListener('click', async () => {
+      try {
+        // Request notification permission
+        if ('Notification' in window) {
+          const permission = await Notification.requestPermission();
+          if (permission !== 'granted') {
+            throw new Error('Notification permission denied. Please allow notifications!');
+          }
+        } else {
+          throw new Error('Browser does not support notifications');
+        }
+
+        status.style.display = 'block';
+        status.className = '';
+        status.innerHTML = '<p style="font-size:18px">📺 Select your test tab in the dialog...</p>';
+
+        // Request screen capture
+        mediaStream = await navigator.mediaDevices.getDisplayMedia({
+          video: {
+            displaySurface: 'browser',
+            width: { ideal: 1920 },
+            height: { ideal: 1080 }
+          },
+          audio: false
+        });
+
+        // Start monitoring
+        isRunning = true;
+        startTime = Date.now();
+        questionsAnalyzed = 0;
+
+        startBtn.style.display = 'none';
+        manualBtn.style.display = 'inline-block';
+        stopBtn.style.display = 'inline-block';
+        intervalSelect.disabled = true;
+        stats.style.display = 'grid';
+
+        status.className = 'success';
+        status.innerHTML = `
+          <h3 style="margin-bottom:10px">✅ Auto Mode Active!</h3>
+          <p>Monitoring started. Notifications will appear automatically.</p>
+          <p style="margin-top:10px;font-size:14px">
+            <strong>Now go to your test tab!</strong><br>
+            This page will work in background.
+          </p>
+        `;
+
+        // Show welcome notification
+        showNotification('🤖 AI Helper Started', 'Monitoring your test. Answers will appear automatically!');
+
+        // Start automatic checking
+        const interval = parseInt(intervalSelect.value) * 1000;
+        intervalId = setInterval(analyzeScreen, interval);
+
+        // Update timer
+        setInterval(updateTimer, 1000);
+
+        // Handle stream end
+        mediaStream.getVideoTracks()[0].addEventListener('ended', () => {
+          stopMonitoring('Screen sharing stopped');
+        });
+
+      } catch (error) {
+        console.error('Error:', error);
+        status.style.display = 'block';
+        status.className = 'error';
+        status.innerHTML = `
+          <h3>❌ Error</h3>
+          <p>${error.message}</p>
+        `;
+      }
+    });
+
+    manualBtn.addEventListener('click', () => {
+      analyzeScreen(true);
+    });
+
+    stopBtn.addEventListener('click', () => {
+      stopMonitoring('Stopped by user');
+    });
+
+    async function analyzeScreen(isManual = false) {
+      if (!isRunning) return;
+
+      try {
+        // Capture frame
+        const video = document.createElement('video');
+        video.srcObject = mediaStream;
+        video.play();
+        
+        await new Promise(resolve => video.onloadedmetadata = resolve);
+        await new Promise(resolve => setTimeout(resolve, 500));
+
+        const canvas = document.createElement('canvas');
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        canvas.getContext('2d').drawImage(video, 0, 0);
+
+        const screenshot = canvas.toDataURL('image/jpeg', 0.6);
+        
+        // Check if screen changed (skip if same as last)
+        if (!isManual && screenshot === lastScreenshot) {
+          console.log('No change detected, skipping...');
+          return;
+        }
+
+        lastScreenshot = screenshot;
+        const screenshotBase64 = screenshot.split(',')[1];
+
+        if (isManual) {
+          showNotification('⏳ Processing...', 'AI is analyzing the question...');
+        }
+
+        // Send to Gemini
+        const response = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${API_KEY}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [{
+                parts: [
+                  {
+                    text: `Test screenshot. Find correct answer. Return ONLY ONE LETTER (A/B/C/D/E). 
+If no clear question visible, return "WAIT".
+Your answer:`
+                  },
+                  {
+                    inline_data: {
+                      mime_type: 'image/jpeg',
+                      data: screenshotBase64
+                    }
+                  }
+                ]
+              }],
+              generationConfig: {
+                temperature: 0.1,
+                maxOutputTokens: 10
+              }
+            })
+          }
+        );
+
+        const data = await response.json();
+        
+        if (data.candidates && data.candidates[0]) {
+          const text = data.candidates[0].content.parts[0].text.trim();
+          
+          if (text.includes('WAIT')) {
+            console.log('No question detected, waiting...');
+            return;
+          }
+
+          const match = text.match(/[A-E]/i);
+          const answer = match ? match[0].toUpperCase() : '?';
+
+          // Update stats
+          questionsAnalyzed++;
+          document.getElementById('questionsCount').textContent = questionsAnalyzed;
+          document.getElementById('lastAnswer').textContent = answer;
+
+          // Show notification
+          showNotification(
+            `✅ ANSWER: ${answer}`,
+            `Question #${questionsAnalyzed} - Correct answer is ${answer}`,
+            true
+          );
+        }
+
+      } catch (error) {
+        console.error('Analysis error:', error);
+        if (isManual) {
+          showNotification('❌ Error', error.message);
+        }
+      }
+    }
+
+    function showNotification(title, body, persistent = false) {
+      if ('Notification' in window && Notification.permission === 'granted') {
+        const notification = new Notification(title, {
+          body: body,
+          icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y="75" font-size="75">🎯</text></svg>',
+          badge: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y="75" font-size="75">✅</text></svg>',
+          requireInteraction: persistent,
+          tag: 'ai-answer-' + Date.now(),
+          vibrate: [200, 100, 200]
+        });
+
+        // Auto-close after 10 seconds if not persistent
+        if (!persistent) {
+          setTimeout(() => notification.close(), 10000);
+        }
+      }
+    }
+
+    function updateTimer() {
+      if (!startTime) return;
+      const elapsed = Math.floor((Date.now() - startTime) / 1000);
+      const minutes = Math.floor(elapsed / 60);
+      const seconds = elapsed % 60;
+      document.getElementById('timeRunning').textContent = 
+        `${minutes}:${seconds.toString().padStart(2, '0')}`;
+    }
+
+    function stopMonitoring(reason) {
+      isRunning = false;
+      
+      if (intervalId) {
+        clearInterval(intervalId);
+        intervalId = null;
+      }
+
+      if (mediaStream) {
+        mediaStream.getTracks().forEach(track => track.stop());
+        mediaStream = null;
+      }
+
+      startBtn.style.display = 'inline-block';
+      manualBtn.style.display = 'none';
+      stopBtn.style.display = 'none';
+      intervalSelect.disabled = false;
+
+      status.className = 'error';
+      status.innerHTML = `<h3>⏹️ Stopped</h3><p>${reason}</p>`;
+
+      showNotification('⏹️ AI Helper Stopped', reason);
+    }
+
+    // Prevent accidental page close
+    window.addEventListener('beforeunload', (e) => {
+      if (isRunning) {
+        e.preventDefault();
+        e.returnValue = '';
+        return '';
+      }
+    });
   </script>
 </body>
 </html>
