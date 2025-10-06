@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>AI Helper Injector</title>
+</head>
+<body>
+  <h1 style="text-align:center;font-family:Arial;padding:50px">
+    ⏳ Запускаю AI Helper...
+  </h1>
+  <script>
+    // Получаем referrer (страницу откуда пришли)
+    const referrer = document.referrer;
+    
+    if (!referrer || referrer.includes('github.io')) {
+      document.body.innerHTML = `
+        <div style="font-family:Arial;padding:50px;text-align:center">
+          <h1>❌ Ошибка</h1>
+          <p>Сначала открой страницу с тестом, ПОТОМ открой эту закладку!</p>
+          <p style="margin-top:20px;color:#666">
+            <small>Эта страница должна открываться с другого сайта</small>
+          </p>
+        </div>
+      `;
+    } else {
+      // Пытаемся инжектить через opener
+      if (window.opener && !window.opener.closed) {
+        try {
+          const script = window.opener.document.createElement('script');
+          script.src = 'https://kiruwfh.github.io/ai-helper/ai-helper.js?' + Date.now();
+          window.opener.document.body.appendChild(script);
+          
+          document.body.innerHTML = `
+            <div style="font-family:Arial;padding:50px;text-align:center">
+              <h1>✅ Скрипт запущен!</h1>
+              <p>Проверь исходную вкладку</p>
+              <p style="margin-top:20px">
+                <small>Это окно закроется через 2 секунды...</small>
+              </p>
+            </div>
+          `;
+          
+          setTimeout(() => window.close(), 2000);
+        } catch(e) {
+          document.body.innerHTML = `
+            <div style="font-family:Arial;padding:50px;text-align:center">
+              <h1>❌ Ошибка доступа</h1>
+              <p>${e.message}</p>
+              <p style="margin-top:20px;color:#666">
+                <small>Страница теста блокирует доступ (CORS/Same-Origin Policy)</small>
+              </p>
+            </div>
+          `;
+        }
+      } else {
+        document.body.innerHTML = `
+          <div style="font-family:Arial;padding:50px;text-align:center">
+            <h1>⚠️ Нет доступа</h1>
+            <p>Не удалось получить доступ к исходной странице</p>
+          </div>
+        `;
+      }
+    }
+  </script>
+</body>
+</html>
