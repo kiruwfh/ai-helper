@@ -66,7 +66,7 @@ Once the bot is running, send any URL to your Telegram bot. The bot replies with
 After the files are delivered you can ask questions in two ways:
 
 1. Write a message that contains both the URL and your question (for example: `https://example.com Какие ключевые выводы?`). The bot will download the page, send the files, and then forward the content to Minimax for an immediate answer.
-2. Send a URL first, then send one or more follow-up messages with your questions. The bot keeps the most recently downloaded page in memory for the current chat and reuses it when a question arrives without a new URL.
+2. Send a URL first, then send one or more follow-up messages with your questions. The bot keeps the most recently downloaded page in memory for the current chat and reuses it when a question arrives without a new URL. Ответы от модели сохраняются вместе с `reasoning_details`, поэтому ИИ продолжает рассуждение и может учитывать предыдущие ответы.
 
 ## Notes
 

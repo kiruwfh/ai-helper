@@ -5,7 +5,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 import tempfile
 
@@ -30,6 +30,11 @@ USER_AGENT = (
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 MAX_TEXT_CONTEXT = 15_000
 MAX_HTML_CONTEXT = 10_000
+SYSTEM_PROMPT = (
+    "Ты — помощник, который отвечает на вопросы по содержимому веб-страниц. "
+    "Используй предоставленные HTML и текст, чтобы отвечать максимально точно. "
+    "Если данных недостаточно, честно сообщи об этом."
+)
 
 
 @dataclass
@@ -81,9 +86,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await status_message.delete()
         await send_assets(update, assets)
         context.user_data["last_assets"] = assets
+        context.user_data.pop("minimax_messages", None)
 
         if question:
-            await send_ai_answer(update, question, assets)
+            await send_ai_answer(update, context, question, assets)
         else:
             await update.message.reply_text(
                 "Страница обработана. Задайте вопрос текстом, и я постараюсь ответить с учётом содержимого."
@@ -101,7 +107,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not question:
         return
 
-    await send_ai_answer(update, question, last_assets)
+    await send_ai_answer(update, context, question, last_assets)
 
 
 async def send_assets(update: Update, assets: PageAssets) -> None:
@@ -182,7 +188,12 @@ async def fetch_page_assets(url: str) -> PageAssets:
         return PageAssets(html=html_output, text=text_output, final_url=final_url)
 
 
-async def send_ai_answer(update: Update, question: str, assets: PageAssets) -> None:
+async def send_ai_answer(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    question: str,
+    assets: PageAssets,
+) -> None:
     """Send a response from the Minimax model back to the user."""
     if not update.message:
         return
@@ -198,7 +209,7 @@ async def send_ai_answer(update: Update, question: str, assets: PageAssets) -> N
     )
 
     try:
-        answer = await ask_minimax(question, assets)
+        answer = await ask_minimax(question, assets, context.user_data)
     except Exception as exc:  # pylint: disable=broad-except
         LOGGER.exception("Failed to query Minimax for %s", assets.final_url)
         await status_message.edit_text(
@@ -318,7 +329,25 @@ def truncate_content(content: str, limit: int) -> str:
     return content[:limit] + "\n…(truncated)…"
 
 
-async def ask_minimax(question: str, assets: PageAssets) -> str:
+def _base_minimax_messages(user_state: Dict[str, object]) -> List[Dict[str, object]]:
+    cached = user_state.get("minimax_messages")
+    if isinstance(cached, list):
+        return list(cached)
+    return [{"role": "system", "content": SYSTEM_PROMPT}]
+
+
+def _store_minimax_response(
+    user_state: Dict[str, object], assistant_message: Dict[str, object]
+) -> None:
+    user_state["minimax_messages"] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        assistant_message,
+    ]
+
+
+async def ask_minimax(
+    question: str, assets: PageAssets, user_state: Dict[str, object]
+) -> str:
     """Call the Minimax M2 model via OpenRouter and return the response text."""
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -328,15 +357,8 @@ async def ask_minimax(question: str, assets: PageAssets) -> str:
     text_context = truncate_content(assets.text, MAX_TEXT_CONTEXT)
     html_context = truncate_content(assets.html, MAX_HTML_CONTEXT)
 
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "Ты — помощник, который отвечает на вопросы по содержимому веб-страниц. "
-                "Используй предоставленные HTML и текст, чтобы отвечать максимально точно. "
-                "Если данных недостаточно, честно сообщи об этом."
-            ),
-        },
+    messages = _base_minimax_messages(user_state)
+    messages.append(
         {
             "role": "user",
             "content": (
@@ -345,8 +367,8 @@ async def ask_minimax(question: str, assets: PageAssets) -> str:
                 f"HTML страницы (может быть сокращён):\n{html_context}\n\n"
                 f"Вопрос пользователя: {question}"
             ),
-        },
-    ]
+        }
+    )
 
     payload = {
         "model": "minimax/minimax-m2:free",
@@ -369,7 +391,17 @@ async def ask_minimax(question: str, assets: PageAssets) -> str:
         content = "".join(part.get("text", "") for part in content)
     if not content:
         raise RuntimeError("Пустой ответ от модели")
-    return content.strip()
+    assistant_message: Dict[str, object] = {
+        "role": "assistant",
+        "content": content.strip(),
+    }
+    reasoning_details = message.get("reasoning_details")
+    if reasoning_details is not None:
+        assistant_message["reasoning_details"] = reasoning_details
+
+    _store_minimax_response(user_state, assistant_message)
+
+    return assistant_message["content"]
 
 
 def ensure_meta_charset(soup: BeautifulSoup) -> None:
