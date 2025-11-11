@@ -5,15 +5,22 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 import tempfile
 
 import httpx
 from bs4 import BeautifulSoup
 from telegram import InputFile, Update
-from telegram.ext import (Application, ApplicationBuilder, CommandHandler,
-                          ContextTypes, MessageHandler, filters)
+from telegram.error import BadRequest
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -26,6 +33,16 @@ HTTP_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+)
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+MAX_TEXT_CONTEXT = 15_000
+MAX_HTML_CONTEXT = 10_000
+MAX_TELEGRAM_MESSAGE = 4_096
+MAX_MINIMAX_HISTORY = 8  # includes the system message
+SYSTEM_PROMPT = (
+    "Ты — помощник, который отвечает на вопросы по содержимому веб-страниц. "
+    "Используй предоставленные HTML и текст, чтобы отвечать максимально точно. "
+    "Если данных недостаточно, честно сообщи об этом."
 )
 
 
@@ -40,7 +57,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send usage instructions when the /start command is issued."""
     message = (
         "Отправьте мне ссылку (http или https), и я пришлю файлы `page.html` и "
-        "`page.txt` с содержимым страницы."
+        "`page.txt` с содержимым страницы. После этого можно задать вопросы по странице — "
+        "я подключу ИИ и отвечу."
     )
     await update.message.reply_text(message)
 
@@ -55,29 +73,50 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not update.message or not update.message.text:
         return
 
-    match = URL_REGEX.search(update.message.text)
-    if not match:
+    text = update.message.text.strip()
+    match = URL_REGEX.search(text)
+
+    if match:
+        url = match.group(1).rstrip(').,"\'">')
+        question = extract_question(text, match.group(0))
+        status_message = await update.message.reply_text(
+            "Загружаю страницу, пожалуйста подождите…"
+        )
+
+        try:
+            assets = await fetch_page_assets(url)
+        except Exception as exc:  # pylint: disable=broad-except
+            LOGGER.exception("Failed to fetch page %s", url)
+            await status_message.edit_text(
+                f"Не удалось загрузить страницу: {exc}"
+            )
+            return
+
+        await status_message.delete()
+        await send_assets(update, assets)
+        context.user_data["last_assets"] = assets
+        context.user_data.pop("minimax_messages", None)
+
+        if question:
+            await send_ai_answer(update, context, question, assets)
+        else:
+            await update.message.reply_text(
+                "Страница обработана. Задайте вопрос текстом, и я постараюсь ответить с учётом содержимого."
+            )
+        return
+
+    last_assets: Optional[PageAssets] = context.user_data.get("last_assets")
+    if not last_assets:
         await update.message.reply_text(
-            "Пожалуйста, отправьте ссылку, чтобы я мог обработать страницу."
+            "Отправьте ссылку, чтобы я смог загрузить страницу и ответить на вопросы."
         )
         return
 
-    url = match.group(1).rstrip(').,"\'">')
-    status_message = await update.message.reply_text(
-        "Загружаю страницу, пожалуйста подождите…"
-    )
-
-    try:
-        assets = await fetch_page_assets(url)
-    except Exception as exc:  # pylint: disable=broad-except
-        LOGGER.exception("Failed to fetch page %s", url)
-        await status_message.edit_text(
-            f"Не удалось загрузить страницу: {exc}"
-        )
+    question = text
+    if not question:
         return
 
-    await status_message.delete()
-    await send_assets(update, assets)
+    await send_ai_answer(update, context, question, last_assets)
 
 
 async def send_assets(update: Update, assets: PageAssets) -> None:
@@ -125,6 +164,12 @@ class TemporaryDirectoryPath:
             self._tempdir.cleanup()
 
 
+def extract_question(text: str, url_fragment: str) -> str:
+    """Return text without the matched URL fragment."""
+    cleaned = text.replace(url_fragment, " ")
+    return " ".join(cleaned.split()).strip()
+
+
 async def fetch_page_assets(url: str) -> PageAssets:
     """Download the page and inline its assets."""
     headers = {"User-Agent": USER_AGENT}
@@ -150,6 +195,48 @@ async def fetch_page_assets(url: str) -> PageAssets:
             text_output = f"Источник: {final_url}"
 
         return PageAssets(html=html_output, text=text_output, final_url=final_url)
+
+
+async def send_ai_answer(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    question: str,
+    assets: PageAssets,
+) -> None:
+    """Send a response from the Minimax model back to the user."""
+    if not update.message:
+        return
+
+    if not OPENROUTER_API_KEY:
+        await update.message.reply_text(
+            "ИИ недоступен: переменная OPENROUTER_API_KEY не установлена."
+        )
+        return
+
+    status_message = await update.message.reply_text(
+        "Отправляю содержимое в модель, пожалуйста подождите…"
+    )
+
+    try:
+        answer = await ask_minimax(question, assets, context.user_data)
+    except Exception as exc:  # pylint: disable=broad-except
+        LOGGER.exception("Failed to query Minimax for %s", assets.final_url)
+        await status_message.edit_text(
+            f"Не удалось получить ответ от модели: {exc}"
+        )
+        return
+
+    parts = split_telegram_message(answer)
+
+    first_part = parts.pop(0)
+    try:
+        await status_message.edit_text(first_part)
+    except BadRequest:
+        LOGGER.warning("Failed to edit status message, sending a new message instead")
+        await update.message.reply_text(first_part)
+
+    for part in parts:
+        await update.message.reply_text(part)
 
 
 async def inline_stylesheets(soup: BeautifulSoup, client: httpx.AsyncClient, base_url: str) -> None:
@@ -252,6 +339,142 @@ async def fetch_binary_asset(client: httpx.AsyncClient, url: str) -> Tuple[bytes
         content_type = guess or "application/octet-stream"
 
     return data, content_type
+
+
+def truncate_content(content: str, limit: int) -> str:
+    """Return content truncated to a maximum number of characters."""
+    if len(content) <= limit:
+        return content
+    return content[:limit] + "\n…(truncated)…"
+
+
+def split_telegram_message(text: str, limit: int = MAX_TELEGRAM_MESSAGE) -> List[str]:
+    """Split long messages so they respect Telegram length limits."""
+    if len(text) <= limit:
+        return [text]
+
+    chunks: List[str] = []
+    current: List[str] = []
+    current_len = 0
+
+    for paragraph in text.split("\n\n"):
+        paragraph_with_spacing = ("\n\n" if current else "") + paragraph
+        if current_len + len(paragraph_with_spacing) <= limit:
+            current.append(paragraph_with_spacing)
+            current_len += len(paragraph_with_spacing)
+        else:
+            if current:
+                chunks.append("".join(current))
+                current = []
+                current_len = 0
+
+            if len(paragraph) > limit:
+                for i in range(0, len(paragraph), limit):
+                    chunks.append(paragraph[i : i + limit])
+            else:
+                current.append(paragraph)
+                current_len = len(paragraph)
+
+    if current:
+        chunks.append("".join(current))
+
+    return chunks
+
+
+def _ensure_system_message(messages: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    if messages and messages[0].get("role") == "system":
+        return messages
+    return [{"role": "system", "content": SYSTEM_PROMPT}, *messages]
+
+
+def _base_minimax_messages(user_state: Dict[str, object]) -> List[Dict[str, object]]:
+    cached = user_state.get("minimax_messages")
+    if isinstance(cached, list) and cached:
+        return [dict(message) for message in _ensure_system_message(list(cached))]
+    return [{"role": "system", "content": SYSTEM_PROMPT}]
+
+
+def _store_minimax_exchange(
+    user_state: Dict[str, object],
+    user_message: Dict[str, object],
+    assistant_message: Dict[str, object],
+) -> None:
+    history: List[Dict[str, object]]
+    cached = user_state.get("minimax_messages")
+    if isinstance(cached, list):
+        history = list(cached)
+    else:
+        history = []
+
+    history = _ensure_system_message(history)
+    history.append(user_message)
+    history.append(assistant_message)
+
+    # Keep only the most recent messages to avoid exceeding context limits.
+    if len(history) > MAX_MINIMAX_HISTORY:
+        # Preserve the system message at index 0 and trim the rest.
+        recent = history[1:]
+        history = [history[0], *recent[-(MAX_MINIMAX_HISTORY - 1) :]]
+
+    user_state["minimax_messages"] = history
+
+
+async def ask_minimax(
+    question: str, assets: PageAssets, user_state: Dict[str, object]
+) -> str:
+    """Call the Minimax M2 model via OpenRouter and return the response text."""
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    text_context = truncate_content(assets.text, MAX_TEXT_CONTEXT)
+    html_context = truncate_content(assets.html, MAX_HTML_CONTEXT)
+
+    messages = _base_minimax_messages(user_state)
+    user_message = {
+        "role": "user",
+        "content": (
+            f"Адрес страницы: {assets.final_url}\n\n"
+            f"Текст страницы (может быть сокращён):\n{text_context}\n\n"
+            f"HTML страницы (может быть сокращён):\n{html_context}\n\n"
+            f"Вопрос пользователя: {question}"
+        ),
+    }
+    messages.append(user_message)
+
+    payload = {
+        "model": "minimax/minimax-m2:free",
+        "messages": messages,
+        "extra_body": {"reasoning": {"enabled": True}},
+    }
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
+        response = await client.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            json=payload,
+        )
+        response.raise_for_status()
+
+    data = response.json()
+    message = data.get("choices", [{}])[0].get("message", {})
+    content = message.get("content")
+    if isinstance(content, list):
+        content = "".join(part.get("text", "") for part in content)
+    if not content:
+        raise RuntimeError("Пустой ответ от модели")
+    assistant_message: Dict[str, object] = {
+        "role": "assistant",
+        "content": content.strip(),
+    }
+    reasoning_details = message.get("reasoning_details")
+    if reasoning_details is not None:
+        assistant_message["reasoning_details"] = reasoning_details
+
+    _store_minimax_exchange(user_state, user_message, assistant_message)
+
+    return assistant_message["content"]
 
 
 def ensure_meta_charset(soup: BeautifulSoup) -> None:
