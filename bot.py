@@ -3,11 +3,12 @@ import logging
 import mimetypes
 import os
 import re
+import tempfile
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin
-import tempfile
 
 import httpx
 from bs4 import BeautifulSoup
@@ -21,6 +22,16 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
+try:
+    import pytesseract
+    from PIL import Image
+
+    OCR_AVAILABLE = True
+except Exception:  # pylint: disable=broad-except
+    OCR_AVAILABLE = False
+    pytesseract = None  # type: ignore[assignment]
+    Image = None  # type: ignore[assignment]
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -51,6 +62,15 @@ class PageAssets:
     html: str
     text: str
     final_url: str
+    images: List["ImageSummary"]
+
+
+@dataclass
+class ImageSummary:
+    source_url: str
+    alt_text: Optional[str]
+    ocr_text: Optional[str]
+    description: str
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -148,6 +168,11 @@ async def send_assets(update: Update, assets: PageAssets) -> None:
                 caption="Извлечённый текст",
             )
 
+    if not OCR_AVAILABLE:
+        await update.message.reply_text(
+            "Внимание: модуль OCR недоступен. Текст на изображениях может не распознаваться."
+        )
+
 
 class TemporaryDirectoryPath:
     """Context manager that creates and cleans up a temporary directory."""
@@ -184,7 +209,7 @@ async def fetch_page_assets(url: str) -> PageAssets:
         inlined_soup = BeautifulSoup(html_content, "html.parser")
 
         await inline_stylesheets(inlined_soup, client, final_url)
-        await inline_images(inlined_soup, client, final_url)
+        image_summaries = await inline_images(inlined_soup, client, final_url)
         ensure_meta_charset(inlined_soup)
 
         html_output = f"<!-- Source: {final_url} -->\n" + inlined_soup.prettify()
@@ -194,7 +219,16 @@ async def fetch_page_assets(url: str) -> PageAssets:
         else:
             text_output = f"Источник: {final_url}"
 
-        return PageAssets(html=html_output, text=text_output, final_url=final_url)
+        image_notes = format_image_summaries_for_text(image_summaries)
+        if image_notes:
+            text_output = f"{text_output}\n\n{image_notes}"
+
+        return PageAssets(
+            html=html_output,
+            text=text_output,
+            final_url=final_url,
+            images=image_summaries,
+        )
 
 
 async def send_ai_answer(
@@ -239,6 +273,87 @@ async def send_ai_answer(
         await update.message.reply_text(part)
 
 
+def extract_text_from_image(data: bytes) -> str:
+    """Return OCR text for the given image bytes if OCR is available."""
+    if not OCR_AVAILABLE or Image is None or pytesseract is None:
+        return ""
+
+    try:
+        with Image.open(BytesIO(data)) as image:
+            if image.mode not in ("RGB", "L"):
+                image = image.convert("RGB")
+            text = pytesseract.image_to_string(image, lang="rus+eng")
+    except Exception:  # pylint: disable=broad-except
+        LOGGER.exception("Failed to run OCR on image")
+        return ""
+
+    return text.strip()
+
+
+def build_image_description(alt_text: Optional[str], ocr_text: str) -> str:
+    """Compose a human-friendly description of the image contents."""
+    parts: List[str] = []
+    if alt_text:
+        parts.append(f"Подпись автора: {alt_text.strip()}")
+    if ocr_text:
+        parts.append(f"Распознанный текст: {ocr_text.strip()}")
+    if not parts:
+        parts.append(
+            "Описание недоступно: распознать содержимое автоматически не удалось."
+        )
+    return "\n".join(parts)
+
+
+def format_image_summaries_for_text(images: List[ImageSummary]) -> str:
+    """Render image summaries for inclusion into the plain-text export."""
+    if not images:
+        return ""
+
+    lines = ["Изображения на странице:"]
+    for idx, summary in enumerate(images, start=1):
+        lines.append(f"\n{idx}. Источник: {summary.source_url}")
+        if summary.alt_text:
+            lines.append(f"   Alt: {summary.alt_text}")
+        if summary.ocr_text:
+            lines.append(f"   Распознанный текст: {summary.ocr_text}")
+        lines.append(f"   Описание: {summary.description}")
+
+    if not OCR_AVAILABLE:
+        lines.append(
+            "\nПримечание: OCR недоступен. Установите Tesseract OCR для распознавания текста на изображениях."
+        )
+
+    return "\n".join(lines)
+
+
+def format_image_summaries_for_ai(images: List[ImageSummary]) -> str:
+    if not images:
+        return "На странице отсутствуют изображения или они не были загружены."
+
+    parts: List[str] = []
+    for idx, summary in enumerate(images, start=1):
+        parts.append(
+            "\n".join(
+                filter(
+                    None,
+                    [
+                        f"Изображение {idx}: {summary.source_url}",
+                        f"Alt: {summary.alt_text}" if summary.alt_text else None,
+                        f"Распознанный текст: {summary.ocr_text}" if summary.ocr_text else None,
+                        f"Описание: {summary.description}",
+                    ],
+                )
+            )
+        )
+
+    if not OCR_AVAILABLE:
+        parts.append(
+            "OCR недоступен на сервере бота, поэтому текст на изображениях мог не распознаться."
+        )
+
+    return "\n\n".join(parts)
+
+
 async def inline_stylesheets(soup: BeautifulSoup, client: httpx.AsyncClient, base_url: str) -> None:
     """Replace external stylesheets with inline <style> tags."""
     for link_tag in list(soup.find_all("link")):
@@ -265,9 +380,13 @@ async def inline_stylesheets(soup: BeautifulSoup, client: httpx.AsyncClient, bas
         link_tag.replace_with(style_tag)
 
 
-async def inline_images(soup: BeautifulSoup, client: httpx.AsyncClient, base_url: str) -> None:
-    """Convert <img> sources to base64 data URIs."""
+async def inline_images(
+    soup: BeautifulSoup, client: httpx.AsyncClient, base_url: str
+) -> List[ImageSummary]:
+    """Convert <img> sources to base64 data URIs and collect OCR summaries."""
     cached_data: Dict[str, str] = {}
+    cached_summaries: Dict[str, ImageSummary] = {}
+    summaries: List[ImageSummary] = []
 
     for img in soup.find_all("img"):
         src = img.get("src")
@@ -275,6 +394,7 @@ async def inline_images(soup: BeautifulSoup, client: httpx.AsyncClient, base_url
             continue
 
         image_url = urljoin(base_url, src)
+        cached_summary = cached_summaries.get(image_url)
         try:
             data_uri = cached_data[image_url]
         except KeyError:
@@ -288,10 +408,41 @@ async def inline_images(soup: BeautifulSoup, client: httpx.AsyncClient, base_url
             data_uri = f"data:{content_type};base64,{encoded}"
             cached_data[image_url] = data_uri
 
+            ocr_text = extract_text_from_image(data)
+            description = build_image_description(img.get("alt"), ocr_text)
+            cached_summary = ImageSummary(
+                source_url=image_url,
+                alt_text=img.get("alt"),
+                ocr_text=ocr_text or None,
+                description=description,
+            )
+            cached_summaries[image_url] = cached_summary
+
+        if cached_summary is None:
+            cached_summary = ImageSummary(
+                source_url=image_url,
+                alt_text=img.get("alt"),
+                ocr_text=None,
+                description=build_image_description(img.get("alt"), ""),
+            )
+
+        alt_text = img.get("alt") or cached_summary.alt_text
+        ocr_text = cached_summary.ocr_text or ""
+        summary_for_instance = ImageSummary(
+            source_url=image_url,
+            alt_text=alt_text,
+            ocr_text=cached_summary.ocr_text,
+            description=build_image_description(alt_text, ocr_text),
+        )
+
+        summaries.append(summary_for_instance)
+
         img["src"] = data_uri
         if img.has_attr("srcset"):
             del img["srcset"]
         img["data-source"] = image_url
+
+    return summaries
 
 
 async def fetch_text_asset(client: httpx.AsyncClient, url: str) -> Tuple[str, str, str]:
@@ -430,6 +581,9 @@ async def ask_minimax(
 
     text_context = truncate_content(assets.text, MAX_TEXT_CONTEXT)
     html_context = truncate_content(assets.html, MAX_HTML_CONTEXT)
+    image_context = truncate_content(
+        format_image_summaries_for_ai(assets.images), MAX_TEXT_CONTEXT
+    )
 
     messages = _base_minimax_messages(user_state)
     user_message = {
@@ -438,6 +592,7 @@ async def ask_minimax(
             f"Адрес страницы: {assets.final_url}\n\n"
             f"Текст страницы (может быть сокращён):\n{text_context}\n\n"
             f"HTML страницы (может быть сокращён):\n{html_context}\n\n"
+            f"Описание изображений: {image_context}\n\n"
             f"Вопрос пользователя: {question}"
         ),
     }
