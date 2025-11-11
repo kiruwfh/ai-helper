@@ -1,6 +1,7 @@
 # Telegram Page Extractor Bot
 
 This repository contains a Telegram bot that downloads the full HTML of a web page – including inline images – and extracts a plain-text representation. The bot sends both the HTML and plain-text files back to the user and can forward the content to the Minimax M2 reasoning model to answer your follow-up questions.
+This repository contains a Telegram bot that downloads the full HTML of a web page – including inline images – and extracts a plain-text representation. The bot sends both the HTML and plain-text files back to the user so the content can be shared with other tools.
 
 ## Features
 
