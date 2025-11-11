@@ -12,8 +12,15 @@ import tempfile
 import httpx
 from bs4 import BeautifulSoup
 from telegram import InputFile, Update
-from telegram.ext import (Application, ApplicationBuilder, CommandHandler,
-                          ContextTypes, MessageHandler, filters)
+from telegram.error import BadRequest
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -30,6 +37,8 @@ USER_AGENT = (
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 MAX_TEXT_CONTEXT = 15_000
 MAX_HTML_CONTEXT = 10_000
+MAX_TELEGRAM_MESSAGE = 4_096
+MAX_MINIMAX_HISTORY = 8  # includes the system message
 SYSTEM_PROMPT = (
     "Ты — помощник, который отвечает на вопросы по содержимому веб-страниц. "
     "Используй предоставленные HTML и текст, чтобы отвечать максимально точно. "
@@ -217,7 +226,17 @@ async def send_ai_answer(
         )
         return
 
-    await status_message.edit_text(answer)
+    parts = split_telegram_message(answer)
+
+    first_part = parts.pop(0)
+    try:
+        await status_message.edit_text(first_part)
+    except BadRequest:
+        LOGGER.warning("Failed to edit status message, sending a new message instead")
+        await update.message.reply_text(first_part)
+
+    for part in parts:
+        await update.message.reply_text(part)
 
 
 async def inline_stylesheets(soup: BeautifulSoup, client: httpx.AsyncClient, base_url: str) -> None:
@@ -329,20 +348,75 @@ def truncate_content(content: str, limit: int) -> str:
     return content[:limit] + "\n…(truncated)…"
 
 
+def split_telegram_message(text: str, limit: int = MAX_TELEGRAM_MESSAGE) -> List[str]:
+    """Split long messages so they respect Telegram length limits."""
+    if len(text) <= limit:
+        return [text]
+
+    chunks: List[str] = []
+    current: List[str] = []
+    current_len = 0
+
+    for paragraph in text.split("\n\n"):
+        paragraph_with_spacing = ("\n\n" if current else "") + paragraph
+        if current_len + len(paragraph_with_spacing) <= limit:
+            current.append(paragraph_with_spacing)
+            current_len += len(paragraph_with_spacing)
+        else:
+            if current:
+                chunks.append("".join(current))
+                current = []
+                current_len = 0
+
+            if len(paragraph) > limit:
+                for i in range(0, len(paragraph), limit):
+                    chunks.append(paragraph[i : i + limit])
+            else:
+                current.append(paragraph)
+                current_len = len(paragraph)
+
+    if current:
+        chunks.append("".join(current))
+
+    return chunks
+
+
+def _ensure_system_message(messages: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    if messages and messages[0].get("role") == "system":
+        return messages
+    return [{"role": "system", "content": SYSTEM_PROMPT}, *messages]
+
+
 def _base_minimax_messages(user_state: Dict[str, object]) -> List[Dict[str, object]]:
     cached = user_state.get("minimax_messages")
-    if isinstance(cached, list):
-        return list(cached)
+    if isinstance(cached, list) and cached:
+        return [dict(message) for message in _ensure_system_message(list(cached))]
     return [{"role": "system", "content": SYSTEM_PROMPT}]
 
 
-def _store_minimax_response(
-    user_state: Dict[str, object], assistant_message: Dict[str, object]
+def _store_minimax_exchange(
+    user_state: Dict[str, object],
+    user_message: Dict[str, object],
+    assistant_message: Dict[str, object],
 ) -> None:
-    user_state["minimax_messages"] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        assistant_message,
-    ]
+    history: List[Dict[str, object]]
+    cached = user_state.get("minimax_messages")
+    if isinstance(cached, list):
+        history = list(cached)
+    else:
+        history = []
+
+    history = _ensure_system_message(history)
+    history.append(user_message)
+    history.append(assistant_message)
+
+    # Keep only the most recent messages to avoid exceeding context limits.
+    if len(history) > MAX_MINIMAX_HISTORY:
+        # Preserve the system message at index 0 and trim the rest.
+        recent = history[1:]
+        history = [history[0], *recent[-(MAX_MINIMAX_HISTORY - 1) :]]
+
+    user_state["minimax_messages"] = history
 
 
 async def ask_minimax(
@@ -358,17 +432,16 @@ async def ask_minimax(
     html_context = truncate_content(assets.html, MAX_HTML_CONTEXT)
 
     messages = _base_minimax_messages(user_state)
-    messages.append(
-        {
-            "role": "user",
-            "content": (
-                f"Адрес страницы: {assets.final_url}\n\n"
-                f"Текст страницы (может быть сокращён):\n{text_context}\n\n"
-                f"HTML страницы (может быть сокращён):\n{html_context}\n\n"
-                f"Вопрос пользователя: {question}"
-            ),
-        }
-    )
+    user_message = {
+        "role": "user",
+        "content": (
+            f"Адрес страницы: {assets.final_url}\n\n"
+            f"Текст страницы (может быть сокращён):\n{text_context}\n\n"
+            f"HTML страницы (может быть сокращён):\n{html_context}\n\n"
+            f"Вопрос пользователя: {question}"
+        ),
+    }
+    messages.append(user_message)
 
     payload = {
         "model": "minimax/minimax-m2:free",
@@ -399,7 +472,7 @@ async def ask_minimax(
     if reasoning_details is not None:
         assistant_message["reasoning_details"] = reasoning_details
 
-    _store_minimax_response(user_state, assistant_message)
+    _store_minimax_exchange(user_state, user_message, assistant_message)
 
     return assistant_message["content"]
 

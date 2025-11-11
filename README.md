@@ -10,6 +10,8 @@ This repository contains a Telegram bot that downloads the full HTML of a web pa
 - Produces a `.txt` file with the readable text extracted from the page.
 - Sends both files back to the Telegram chat as downloadable documents.
 - Uses the [Minimax M2](https://openrouter.ai/minimax/minimax-m2) model via OpenRouter to answer questions about the downloaded page.
+- Remembers the latest exchange with Minimax (включая `reasoning_details`), чтобы продолжить рассуждения при последующих вопросах.
+- Automatically splits very long AI answers into several Telegram messages to avoid hitting the 4096-character limit.
 
 ## Prerequisites
 
@@ -66,7 +68,7 @@ Once the bot is running, send any URL to your Telegram bot. The bot replies with
 After the files are delivered you can ask questions in two ways:
 
 1. Write a message that contains both the URL and your question (for example: `https://example.com Какие ключевые выводы?`). The bot will download the page, send the files, and then forward the content to Minimax for an immediate answer.
-2. Send a URL first, then send one or more follow-up messages with your questions. The bot keeps the most recently downloaded page in memory for the current chat and reuses it when a question arrives without a new URL. Ответы от модели сохраняются вместе с `reasoning_details`, поэтому ИИ продолжает рассуждение и может учитывать предыдущие ответы.
+2. Send a URL first, then send one or more follow-up messages with your questions. The bot keeps the most recently downloaded page in memory for the current chat and reuses it when a question arrives without a new URL. Ответы от модели сохраняются вместе с `reasoning_details` и последним вопросом, поэтому ИИ продолжает рассуждение и может учитывать предыдущие ответы.
 
 ## Notes
 
